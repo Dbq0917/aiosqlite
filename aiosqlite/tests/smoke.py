@@ -4,6 +4,7 @@
 import asyncio
 import sqlite3
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
@@ -158,6 +159,61 @@ class SmokeTest(IsolatedAsyncioTestCase):
         self.assertEqual(len(results), 4)
         for rows in results.values():
             self.assertEqual(len(rows), 2)
+
+    async def test_worker_pool_shares_single_connection(self):
+        # Connection created on the main thread, requests dispatched across
+        # an 8-thread pool where each request may run on a different thread.
+        # Every request must succeed while the underlying sqlite3 connection
+        # stays unique: worker threads must not reconnect per thread.
+        pool_size = 8
+        request_count = 64
+
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table pool_test (id integer primary key)")
+            await db.commit()
+
+            real_connect = sqlite3.connect
+            connect_calls = []
+
+            def counting_connect(*args, **kwargs):
+                connect_calls.append(args[0] if args else kwargs.get("database"))
+                return real_connect(*args, **kwargs)
+
+            def worker(request_id):
+                async def one_request():
+                    await db.execute(
+                        "insert into pool_test (id) values (?)", (request_id,)
+                    )
+                    async with db.execute(
+                        "select count(*) from pool_test"
+                    ) as cursor:
+                        return await cursor.fetchone()
+
+                worker_loop = asyncio.new_event_loop()
+                try:
+                    return worker_loop.run_until_complete(one_request())
+                finally:
+                    worker_loop.close()
+
+            with patch.object(sqlite3, "connect", side_effect=counting_connect):
+                with ThreadPoolExecutor(max_workers=pool_size) as pool:
+                    main_loop = asyncio.get_running_loop()
+                    results = await asyncio.gather(
+                        *(
+                            main_loop.run_in_executor(pool, worker, request_id)
+                            for request_id in range(request_count)
+                        )
+                    )
+
+            self.assertEqual(len(results), request_count)
+            self.assertEqual(
+                connect_calls, [], "worker threads must not reconnect"
+            )
+            self.assertTrue(db._thread.is_alive())
+
+            async with db.execute("select count(*) from pool_test") as cursor:
+                (row_count,) = await cursor.fetchone()
+            self.assertEqual(row_count, request_count)
 
     async def test_context_cursor(self):
         async with aiosqlite.connect(self.db) as db:
