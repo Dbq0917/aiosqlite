@@ -107,6 +107,81 @@ class SmokeTest(IsolatedAsyncioTestCase):
 
         assert len(rows) == 10
 
+    async def test_rollback_isolated_between_tasks(self):
+        """One task's rollback must not undo another task's writes."""
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table rollback_isolation (i integer, k integer)")
+            await db.commit()
+
+            a_in_transaction = asyncio.Event()
+
+            async def task_a():
+                # opens an implicit transaction and holds it
+                await db.execute("insert into rollback_isolation (k) values (1)")
+                a_in_transaction.set()
+                # give task B time to queue its write behind the lease
+                await asyncio.sleep(0.2)
+                await db.rollback()
+
+            async def task_b():
+                await a_in_transaction.wait()
+                # parked while task A holds the transaction lease, then runs
+                # in its own transaction after A's rollback
+                await db.execute("insert into rollback_isolation (k) values (2)")
+                await db.commit()
+
+            await asyncio.gather(task_a(), task_b())
+
+            cursor = await db.execute("select k from rollback_isolation")
+            rows = await cursor.fetchall()
+            # A's rollback removes only its own row; B's write survives
+            self.assertEqual(rows, [(2,)])
+
+    async def test_concurrent_transactions_on_shared_connection(self):
+        """Many tasks can run transactions on one shared connection."""
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute(
+                "create table concurrent_transactions (i integer, k integer)"
+            )
+            await db.commit()
+
+            async def write_one(value):
+                await db.execute(
+                    "insert into concurrent_transactions (k) values (?)", [value]
+                )
+                await db.commit()
+
+            await asyncio.gather(*[write_one(i) for i in range(20)])
+
+            cursor = await db.execute("select k from concurrent_transactions")
+            rows = await cursor.fetchall()
+            self.assertEqual(len(rows), 20)
+            self.assertEqual(sorted(row[0] for row in rows), list(range(20)))
+
+    async def test_lease_released_when_owner_task_finishes(self):
+        """A task ending mid-transaction must not block the connection."""
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute(
+                "create table abandoned_transaction (i integer, k integer)"
+            )
+            await db.commit()
+
+            async def abandoned():
+                await db.execute("insert into abandoned_transaction (k) values (1)")
+                # task ends without committing; its lease must be released
+
+            task = asyncio.ensure_future(abandoned())
+            await task
+
+            # the open transaction is kept (not rolled back) and remains
+            # usable by whichever task runs next
+            await db.execute("insert into abandoned_transaction (k) values (2)")
+            await db.commit()
+
+            cursor = await db.execute("select k from abandoned_transaction")
+            rows = await cursor.fetchall()
+            self.assertEqual(rows, [(1,), (2,)])
+
     async def test_iterable_cursor(self):
         async with aiosqlite.connect(self.db) as db:
             cursor = await db.cursor()

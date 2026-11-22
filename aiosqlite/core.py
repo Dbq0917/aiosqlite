@@ -42,37 +42,145 @@ def set_exception(fut: asyncio.Future, e: BaseException) -> None:
 
 
 _STOP_RUNNING_SENTINEL = object()
-_TxQueue = SimpleQueue[tuple[Optional[asyncio.Future], Callable[[], Any]]]
+
+# Interval (in seconds) at which the worker thread re-checks whether the task
+# holding the transaction lease has finished, while other operations are parked.
+# This is only a backstop; leases are normally released immediately via a
+# done-callback on the owning task.
+_LEASE_CHECK_INTERVAL = 0.1
+
+# Result of every function run on the worker thread:
+# (result, error, in_transaction)
+_TxResult = tuple[Any, Optional[BaseException], bool]
+
+# Queue item: (future to fulfill, wrapped function, owning asyncio task or None)
+_TxItem = tuple[Optional[asyncio.Future], Callable[[], _TxResult], Any]
+_TxQueue = SimpleQueue[_TxItem]
 
 
-def _connection_worker_thread(tx: _TxQueue):
+def _release_lease() -> _TxResult:
+    """
+    No-op queued when a lease-holding task finishes.
+
+    Reports ``in_transaction=False`` so the worker drops the finished task's
+    lease, letting parked operations from other tasks proceed. Any transaction
+    left open is deliberately kept; it remains usable (and committable) by
+    whichever task runs next.
+    """
+    return None, None, False
+
+
+def _connection_worker_thread(tx: _TxQueue) -> None:
     """
     Execute function calls on a separate thread.
 
+    Enforces per-task transaction isolation on the shared connection: once a
+    task's operation leaves the connection inside a transaction, that task owns
+    the connection. Operations queued by other tasks are parked until the owner
+    commits, rolls back, or finishes. This prevents one task's statements from
+    silently joining (and being rolled back with) another task's transaction.
+
     :meta private:
     """
+    owner: Any = None
+    parked: list[_TxItem] = []
+
+    def run(item: _TxItem) -> tuple[Any, bool]:
+        future, function, _ = item
+        LOG.debug("executing %s", function)
+        result, error, in_transaction = function()
+        if future is not None:
+            if error is not None:
+                LOG.debug("returning exception %s", error)
+                future.get_loop().call_soon_threadsafe(set_exception, future, error)
+            else:
+                LOG.debug("operation %s completed", function)
+                future.get_loop().call_soon_threadsafe(set_result, future, result)
+        return result, in_transaction
+
+    def update_lease(tag: Any, in_transaction: bool) -> None:
+        nonlocal owner
+        if tag is None:
+            return
+        if in_transaction:
+            if owner is None:
+                owner = tag
+                arm_release_callback(tag)
+        elif owner is tag:
+            owner = None
+
+    def arm_release_callback(task: "asyncio.Task[Any]") -> None:
+        def release(done_task: "asyncio.Task[Any]") -> None:
+            tx.put_nowait((None, _release_lease, done_task))
+
+        try:
+            task.get_loop().call_soon_threadsafe(task.add_done_callback, release)
+        except Exception:
+            # Owner's loop is gone; the periodic check below will release it.
+            pass
+
+    def drain_parked() -> None:
+        remaining = []
+        for pending in parked:
+            ptag = pending[2]
+            if ptag is not None and owner is not None and ptag is not owner:
+                remaining.append(pending)
+                continue
+            _, in_transaction = run(pending)
+            update_lease(ptag, in_transaction)
+        parked[:] = remaining
+
     while True:
         # Continues running until all queue items are processed,
         # even after connection is closed (so we can finalize all
         # futures)
 
-        future, function = tx.get()
+        if parked and owner is not None:
+            try:
+                item: Optional[_TxItem] = tx.get(timeout=_LEASE_CHECK_INTERVAL)
+            except Empty:
+                item = None
+        else:
+            item = tx.get()
 
-        try:
-            LOG.debug("executing %s", function)
-            result = function()
+        # A finished owner can no longer commit or roll back; drop its lease
+        # so parked operations are not blocked forever.
+        if owner is not None and owner.done():
+            owner = None
 
-            if future:
-                future.get_loop().call_soon_threadsafe(set_result, future, result)
-            LOG.debug("operation %s completed", function)
+        if item is None:
+            if owner is None:
+                drain_parked()
+            continue
 
-            if result is _STOP_RUNNING_SENTINEL:
-                break
+        tag = item[2]
+        if tag is not None and owner is not None and tag is not owner:
+            parked.append(item)
+            continue
 
-        except BaseException as e:  # noqa B036
-            LOG.debug("returning exception %s", e)
-            if future:
-                future.get_loop().call_soon_threadsafe(set_exception, future, e)
+        result, in_transaction = run(item)
+        update_lease(tag, in_transaction)
+
+        if result is _STOP_RUNNING_SENTINEL:
+            for parked_future, _, _ in parked:
+                if parked_future is not None:
+                    try:
+                        parked_future.get_loop().call_soon_threadsafe(
+                            set_exception,
+                            parked_future,
+                            ValueError("Connection closed"),
+                        )
+                    except Exception:
+                        pass
+            break
+
+        # drop references to the queued closure and its result so neither the
+        # connection nor query results are kept alive by this thread
+        item = None
+        result = None
+
+        if owner is None:
+            drain_parked()
 
 
 class Connection:
@@ -128,7 +236,7 @@ class Connection:
         except Exception:
             future = None
 
-        self._tx.put_nowait((future, close_and_stop))
+        self._tx.put_nowait((future, self._wrap(close_and_stop), None))
         return future
 
     @property
@@ -147,15 +255,62 @@ class Connection:
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
-    async def _execute(self, fn, *args, **kwargs):
-        """Queue a function with the given arguments for execution."""
+    def _wrap(self, function: Callable[[], Any]) -> Callable[[], _TxResult]:
+        """
+        Wrap a function so the worker thread gets a uniform result tuple of
+        (result, error, in_transaction), capturing exceptions and reporting
+        whether the connection is inside a transaction afterwards.
+        """
+
+        def run() -> _TxResult:
+            error: Optional[BaseException] = None
+            try:
+                result: Any = function()
+            except BaseException as e:  # noqa B036
+                result = None
+                error = e
+
+            try:
+                conn = self._connection
+                in_transaction = (
+                    bool(conn.in_transaction) if conn is not None else False
+                )
+            except Exception:
+                in_transaction = False
+
+            return result, error, in_transaction
+
+        return run
+
+    async def _execute(
+        self,
+        fn,
+        *args,
+        _bypass_lease: bool = False,
+        _task: Optional["asyncio.Task[Any]"] = None,
+        **kwargs,
+    ):
+        """
+        Queue a function with the given arguments for execution.
+
+        Each call is tagged with the current asyncio task. While a task holds
+        the transaction lease (it has an open transaction), calls from other
+        tasks are parked until the lease is released, so concurrent
+        transactions on this shared connection stay isolated from each other.
+        """
         if not self._running or not self._connection:
             raise ValueError("Connection closed")
 
         function = partial(fn, *args, **kwargs)
         future = asyncio.get_event_loop().create_future()
 
-        self._tx.put_nowait((future, function))
+        if _bypass_lease:
+            tag = None
+        elif _task is not None:
+            tag = _task
+        else:
+            tag = asyncio.current_task()
+        self._tx.put_nowait((future, self._wrap(function), tag))
 
         return await future
 
@@ -164,7 +319,7 @@ class Connection:
         if self._connection is None:
             try:
                 future = asyncio.get_event_loop().create_future()
-                self._tx.put_nowait((future, self._connector))
+                self._tx.put_nowait((future, self._wrap(self._connector), None))
                 self._connection = await future
             except BaseException:
                 self.stop()
@@ -203,7 +358,7 @@ class Connection:
             return
 
         try:
-            await self._execute(self._conn.close)
+            await self._execute(self._conn.close, _bypass_lease=True)
         except Exception:
             LOG.info("exception occurred while closing connection")
             raise
@@ -382,6 +537,7 @@ class Connection:
 
         """
         dump_queue: Queue = Queue()
+        caller_task = asyncio.current_task()
 
         def dumper():
             try:
@@ -394,7 +550,9 @@ class Connection:
                 dump_queue.put_nowait(None)
                 raise
 
-        fut = self._execute(dumper)
+        # the helper task inherits this task's identity so it is not blocked
+        # by our own transaction lease
+        fut = self._execute(dumper, _task=caller_task)
         task = asyncio.ensure_future(fut)
 
         while True:
