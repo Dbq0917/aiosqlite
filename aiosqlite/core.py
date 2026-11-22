@@ -157,7 +157,33 @@ class Connection:
 
         self._tx.put_nowait((future, function))
 
-        return await future
+        try:
+            return await future
+        except asyncio.CancelledError:
+            # The awaiting coroutine was cancelled (eg, by an upper-level
+            # timeout) while the function was still queued or running.
+            # Whatever it already did may have left an open transaction
+            # holding the database write lock, so queue a rollback on the
+            # worker thread to release it before re-raising.
+            self._queue_rollback()
+            raise
+
+    def _queue_rollback(self) -> None:
+        """Queue a rollback that runs only if a transaction is still open."""
+        if self._connection is None:
+            return
+
+        def rollback_if_needed() -> None:
+            connection = self._connection
+            # Runs on the worker thread, after the cancelled operation.
+            # If that operation (or a later one) already committed, there is
+            # no open transaction and this is a no-op, so committed work is
+            # never undone.
+            if connection is not None and connection.in_transaction:
+                LOG.warning("rolling back transaction abandoned by cancelled task")
+                connection.rollback()
+
+        self._tx.put_nowait((None, rollback_if_needed))
 
     async def _connect(self) -> "Connection":
         """Connect to the actual sqlite database."""

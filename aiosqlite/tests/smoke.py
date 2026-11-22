@@ -4,6 +4,7 @@
 import asyncio
 import sqlite3
 import sys
+import time
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
@@ -469,6 +470,71 @@ class SmokeTest(IsolatedAsyncioTestCase):
 
         # no error
         await db.close()
+
+    async def test_cancel_releases_transaction_lock(self):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table cancel_tx (id integer)")
+            await db.commit()
+
+            def slow():
+                time.sleep(0.5)
+                return 1
+
+            await db.create_function("slow", 0, slow)
+
+            async def txn():
+                await db.execute("insert into cancel_tx values (1)")
+                # cancelled while blocked on this, mid-transaction
+                await db.execute("select slow()")
+                await db.commit()
+
+            task = asyncio.ensure_future(txn())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            # queued behind the cancelled op and its rollback
+            await db.execute("select 1")
+            self.assertFalse(db.in_transaction)
+
+        # write lock was released: a separate connection can write at once
+        async with aiosqlite.connect(self.db, timeout=0.5) as db2:
+            await db2.execute("insert into cancel_tx values (2)")
+            await db2.commit()
+            async with db2.execute("select * from cancel_tx") as cursor:
+                rows = await cursor.fetchall()
+                # the cancelled transaction was rolled back
+                self.assertEqual(rows, [(2,)])
+
+    async def test_cancel_does_not_undo_committed_transaction(self):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table cancel_commit (id integer)")
+            await db.execute("insert into cancel_commit values (1)")
+            await db.commit()
+
+            def slow():
+                time.sleep(0.5)
+                return 1
+
+            await db.create_function("slow", 0, slow)
+
+            async def query():
+                await db.execute("select slow()")
+
+            task = asyncio.ensure_future(query())
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+            # flush the queue past any queued rollback
+            await db.execute("select 1")
+
+        async with aiosqlite.connect(self.db) as db2:
+            async with db2.execute("select * from cancel_commit") as cursor:
+                rows = await cursor.fetchall()
+                self.assertEqual(rows, [(1,)])
 
     async def test_backup_aiosqlite(self):
         def progress(a, b, c):
