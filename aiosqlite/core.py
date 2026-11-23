@@ -196,6 +196,29 @@ class Connection:
         """Roll back the current transaction."""
         await self._execute(self._conn.rollback)
 
+    async def refresh(self) -> None:
+        """Release any held WAL snapshot so subsequent reads see the latest
+        committed data.
+
+        In WAL mode, a connection that keeps a read transaction open (for
+        example via ``BEGIN``) continues to see the database snapshot that was
+        current when the transaction started, even after other connections
+        commit new data. Ending that read transaction lets the next statement
+        acquire a fresh snapshot, while the connection itself stays open and
+        reusable.
+
+        This ends the current transaction via ``ROLLBACK`` if one is active and
+        is a no-op otherwise; uncommitted changes on this connection are
+        discarded. It is intended for long-lived read connections that must
+        observe writes committed elsewhere without reconnecting.
+        """
+
+        def _refresh() -> None:
+            if self._conn.in_transaction:
+                self._conn.rollback()
+
+        await self._execute(_refresh)
+
     async def close(self) -> None:
         """Complete queued queries/cursors and close the connection."""
 

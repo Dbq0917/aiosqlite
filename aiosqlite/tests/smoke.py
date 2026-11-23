@@ -107,6 +107,69 @@ class SmokeTest(IsolatedAsyncioTestCase):
 
         assert len(rows) == 10
 
+    async def test_refresh_releases_stale_wal_snapshot(self):
+        async with aiosqlite.connect(self.db) as writer:
+            mode = await writer.execute_fetchall("pragma journal_mode=wal")
+            if mode[0][0].lower() != "wal":
+                raise SkipTest("WAL journal mode unavailable")
+
+            await writer.execute("create table wal_visibility (v integer)")
+            await writer.execute("insert into wal_visibility (v) values (1)")
+            await writer.commit()
+
+            async with aiosqlite.connect(self.db) as reader:
+                # A long-lived read transaction pins the snapshot taken at BEGIN.
+                await reader.execute("begin")
+                self.assertEqual(
+                    await reader.execute_fetchall("select v from wal_visibility"),
+                    [(1,)],
+                )
+
+                async def write_value(value):
+                    await writer.execute(
+                        "update wal_visibility set v = ?", [value]
+                    )
+                    await writer.commit()
+
+                await write_value(2)
+
+                # The open read transaction still sees the old snapshot.
+                self.assertEqual(
+                    await reader.execute_fetchall("select v from wal_visibility"),
+                    [(1,)],
+                )
+
+                # Ending the read transaction makes committed writes visible
+                # without reopening the connection.
+                await reader.refresh()
+                self.assertFalse(reader.in_transaction)
+                self.assertEqual(
+                    await reader.execute_fetchall("select v from wal_visibility"),
+                    [(2,)],
+                )
+
+                # The connection stays reusable and keeps seeing fresh data.
+                await reader.execute("begin")
+                await write_value(3)
+                await reader.refresh()
+                self.assertEqual(
+                    await reader.execute_fetchall("select v from wal_visibility"),
+                    [(3,)],
+                )
+
+    async def test_refresh_without_open_transaction(self):
+        async with aiosqlite.connect(self.db) as db:
+            await db.execute("create table no_tx (v integer)")
+            await db.commit()
+            self.assertFalse(db.in_transaction)
+
+            # No transaction to end: refresh must be a safe no-op.
+            await db.refresh()
+            self.assertFalse(db.in_transaction)
+            self.assertEqual(
+                await db.execute_fetchall("select v from no_tx"), []
+            )
+
     async def test_iterable_cursor(self):
         async with aiosqlite.connect(self.db) as db:
             cursor = await db.cursor()

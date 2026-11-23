@@ -81,6 +81,37 @@ connections.  Cursors are similarly proxies to the real cursors, and provide
 async iterators to query results.
 
 
+Read visibility in WAL mode
+---------------------------
+
+When the database runs in WAL mode (``PRAGMA journal_mode=WAL``), a read
+connection that keeps a transaction open (for example with ``BEGIN``) pins the
+database snapshot taken when that transaction started. Writes committed by
+other connections stay invisible to it until the read transaction ends, so a
+long-lived reader can serve stale data even though it keeps using the same open
+connection.
+
+Connections in autocommit mode (the default, one query per statement) acquire a
+fresh snapshot for every statement and always see the latest committed data.
+For a long-lived read connection that holds an explicit read transaction, call
+``await db.refresh()`` between read cycles to end that transaction and release
+the stale snapshot; the connection stays open and reusable, and the next query
+observes all commits made elsewhere:
+
+.. code-block:: python
+
+    reader = await aiosqlite.connect("example.db")
+
+    async def latest_rows():
+        await reader.refresh()  # release any snapshot held by a prior read
+        async with reader.execute("SELECT * FROM events") as cursor:
+            return await cursor.fetchall()
+
+``refresh()`` rolls back the active transaction if one exists (discarding
+uncommitted changes on that connection) and is a no-op when no transaction is
+open. It does not close or reopen the connection.
+
+
 License
 -------
 
